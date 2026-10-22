@@ -20,12 +20,17 @@ const (
 
 // Link is one repository link together with where it was written.
 type Link struct {
-	File string
-	Line int
-	URL  string
-	Kind Kind
-	Ref  string
+	File  string
+	Line  int
+	URL   string
+	Kind  Kind
+	Owner string
+	Name  string
+	Ref   string
 }
+
+// Pinned reports whether the link already names a full commit.
+func (l Link) Pinned() bool { return fullCommit.MatchString(l.Ref) }
 
 // Reason names why a link was refused.
 type Reason string
@@ -149,7 +154,7 @@ func parse(rawURL string) (Link, bool) {
 		if !ok {
 			return Link{}, false
 		}
-		return Link{URL: rawURL, Kind: kind, Ref: segments[3]}, true
+		return Link{URL: rawURL, Kind: kind, Owner: segments[0], Name: segments[1], Ref: segments[3]}, true
 	case "raw.githubusercontent.com":
 		if len(segments) < 4 {
 			return Link{}, false
@@ -158,7 +163,7 @@ func parse(rawURL string) (Link, bool) {
 		if ref == "refs" && len(segments) >= 6 {
 			ref = strings.Join(segments[2:5], "/")
 		}
-		return Link{URL: rawURL, Kind: KindRaw, Ref: ref}, true
+		return Link{URL: rawURL, Kind: KindRaw, Owner: segments[0], Name: segments[1], Ref: ref}, true
 	}
 	return Link{}, false
 }
