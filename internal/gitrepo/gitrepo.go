@@ -25,6 +25,9 @@ var (
 	ErrNotQuotable    = errors.New("tree entry is not quotable code")
 	ErrObjectName     = errors.New("not a 40-character lowercase object name")
 	ErrBadPath        = errors.New("not a path that can be read out of a commit")
+	ErrMissingRef     = errors.New("ref is not in the clone")
+	ErrAmbiguousRef   = errors.New("ref is both a branch and a tag")
+	ErrRefName        = errors.New("not a ref name git may be asked about")
 )
 
 const (
@@ -32,7 +35,10 @@ const (
 	modeSubmodule = "160000"
 )
 
-var objectName = regexp.MustCompile(`^[0-9a-f]{40}$`)
+var (
+	objectName = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	refName    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]*$`)
+)
 
 // MissingHistoryError names the commit and the clone that does not have it. A
 // shallow clone is worded apart, because there the absence says nothing about
@@ -65,6 +71,29 @@ func (e *NotQuotableError) Error() string {
 }
 
 func (e *NotQuotableError) Unwrap() error { return ErrNotQuotable }
+
+// AmbiguousRefError names a ref that exists as both a branch and a tag.
+type AmbiguousRefError struct {
+	Name   string
+	Branch string
+	Tag    string
+	Dir    string
+}
+
+func (e *AmbiguousRefError) Error() string {
+	return fmt.Sprintf("%q in the clone at %s is both the branch %s and the tag %s; one of them has to be named as refs/heads/%s or refs/tags/%s", e.Name, e.Dir, e.Branch, e.Tag, e.Name, e.Name)
+}
+
+func (e *AmbiguousRefError) Unwrap() error { return ErrAmbiguousRef }
+
+// Ref is a branch or tag name together with the commit it reaches.
+type Ref struct {
+	Name   string
+	Full   string
+	Branch bool
+	Tag    bool
+	SHA    string
+}
 
 // Repo is a local clone that is open for reading.
 type Repo struct {
@@ -112,6 +141,79 @@ func (r *Repo) RequireCommit(commit string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.requireCommit(commit)
+}
+
+// Resolve finds name as a branch or a tag and reports the commit it reaches. A
+// name that is both a branch and a tag is refused instead of resolved: git
+// prefers one of them, and a reader following the other name would arrive at a
+// different commit than the one recorded.
+func (r *Repo) Resolve(name string) (Ref, error) {
+	if err := validRefName(name); err != nil {
+		return Ref{}, err
+	}
+	if strings.HasPrefix(name, "refs/") {
+		sha, found, err := r.refCommit(name)
+		switch {
+		case err != nil:
+			return Ref{}, err
+		case !found:
+			return Ref{}, r.missingRef(name)
+		}
+		return Ref{
+			Name: name, Full: name, SHA: sha,
+			Branch: strings.HasPrefix(name, "refs/heads/"),
+			Tag:    strings.HasPrefix(name, "refs/tags/"),
+		}, nil
+	}
+	branch, isBranch, err := r.refCommit("refs/heads/" + name)
+	if err != nil {
+		return Ref{}, err
+	}
+	tag, isTag, err := r.refCommit("refs/tags/" + name)
+	if err != nil {
+		return Ref{}, err
+	}
+	switch {
+	case isBranch && isTag:
+		return Ref{}, &AmbiguousRefError{Name: name, Branch: branch, Tag: tag, Dir: r.dir}
+	case isBranch:
+		return Ref{Name: name, Full: "refs/heads/" + name, Branch: true, SHA: branch}, nil
+	case isTag:
+		return Ref{Name: name, Full: "refs/tags/" + name, Tag: true, SHA: tag}, nil
+	}
+	return Ref{}, r.missingRef(name)
+}
+
+func (r *Repo) missingRef(name string) error {
+	return fmt.Errorf("%q is not a branch or a tag in the clone at %s: %w", name, r.dir, ErrMissingRef)
+}
+
+// refCommit reports the commit a fully qualified ref reaches. A ref that is
+// absent and a ref git declines to peel answer the same way here: there is
+// nothing to record for that name.
+func (r *Repo) refCommit(full string) (string, bool, error) {
+	out, err := r.run("rev-parse", "--verify", "--quiet", "--end-of-options", full+"^{commit}")
+	if err != nil {
+		return "", false, nil
+	}
+	sha := strings.TrimSpace(out)
+	if !objectName.MatchString(sha) {
+		return "", false, fmt.Errorf("git resolved %s to %q: %w", full, sha, ErrObjectName)
+	}
+	return sha, true, nil
+}
+
+func validRefName(name string) error {
+	switch {
+	case name == "",
+		!refName.MatchString(name),
+		strings.Contains(name, ".."),
+		strings.Contains(name, "//"),
+		strings.HasSuffix(name, "/"),
+		strings.HasSuffix(name, ".lock"):
+		return fmt.Errorf("%q: %w", name, ErrRefName)
+	}
+	return nil
 }
 
 // Blob returns the bytes of path at commit. A symlink and a submodule entry

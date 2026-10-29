@@ -18,19 +18,51 @@ const (
 	KindRaw    Kind = "raw"
 )
 
-// Link is one repository link together with where it was written.
+// Link is one repository link together with where it was written. Col is the
+// byte offset of URL inside its line, so a caller may rewrite the link in
+// place instead of searching the line for it again.
 type Link struct {
 	File  string
 	Line  int
+	Col   int
 	URL   string
 	Kind  Kind
 	Owner string
 	Name  string
 	Ref   string
+
+	// refAt is where Ref starts inside URL and tail holds the segments after
+	// it; together they say which names the link could be holding.
+	refAt int
+	tail  []string
 }
 
 // Pinned reports whether the link already names a full commit.
 func (l Link) Pinned() bool { return fullCommit.MatchString(l.Ref) }
+
+// Candidates returns every ref name the link could be holding, longest first.
+// A ref with slashes makes blob/feature/x/path ambiguous, so a caller resolves
+// the longest name that exists rather than guessing where the path begins.
+func (l Link) Candidates() []string {
+	names := make([]string, 0, len(l.tail)+1)
+	for i := len(l.tail); i >= 0; i-- {
+		parts := make([]string, 0, i+1)
+		parts = append(parts, l.Ref)
+		parts = append(parts, l.tail[:i]...)
+		names = append(names, strings.Join(parts, "/"))
+	}
+	return names
+}
+
+// Pin returns the URL with ref replaced by sha, and reports false when ref is
+// not a name this link holds.
+func (l Link) Pin(ref, sha string) (string, bool) {
+	end := l.refAt + len(ref)
+	if l.refAt <= 0 || ref == "" || end > len(l.URL) || l.URL[l.refAt:end] != ref {
+		return "", false
+	}
+	return l.URL[:l.refAt] + sha + l.URL[end:], true
+}
 
 // Reason names why a link was refused.
 type Reason string
@@ -98,11 +130,11 @@ func Extract(file, source string) []Link {
 			continue
 		}
 		for _, candidate := range findURLs(stripCodeSpans(line)) {
-			link, ok := parse(candidate)
+			link, ok := parse(candidate.url)
 			if !ok {
 				continue
 			}
-			link.File, link.Line = file, i+1
+			link.File, link.Line, link.Col = file, i+1, candidate.col
 			found = append(found, link)
 		}
 	}
@@ -140,11 +172,20 @@ func parse(rawURL string) (Link, bool) {
 	if !ok {
 		return Link{}, false
 	}
+	offset := len(rawURL) - len(rest)
 	if i := strings.IndexAny(rest, "#?"); i >= 0 {
 		rest = rest[:i]
 	}
-	host, path, _ := strings.Cut(rest, "/")
-	segments := strings.Split(strings.Trim(path, "/"), "/")
+	host, path, ok := strings.Cut(rest, "/")
+	if !ok {
+		return Link{}, false
+	}
+	offset += len(host) + 1
+	for strings.HasPrefix(path, "/") {
+		path = path[1:]
+		offset++
+	}
+	segments := strings.Split(strings.TrimRight(path, "/"), "/")
 	switch strings.ToLower(host) {
 	case "github.com", "www.github.com":
 		if len(segments) < 4 {
@@ -154,18 +195,31 @@ func parse(rawURL string) (Link, bool) {
 		if !ok {
 			return Link{}, false
 		}
-		return Link{URL: rawURL, Kind: kind, Owner: segments[0], Name: segments[1], Ref: segments[3]}, true
+		return Link{
+			URL: rawURL, Kind: kind, Owner: segments[0], Name: segments[1], Ref: segments[3],
+			refAt: segmentOffset(offset, segments, 3), tail: segments[4:],
+		}, true
 	case "raw.githubusercontent.com":
 		if len(segments) < 4 {
 			return Link{}, false
 		}
-		ref := segments[2]
+		ref, tail := segments[2], segments[3:]
 		if ref == "refs" && len(segments) >= 6 {
-			ref = strings.Join(segments[2:5], "/")
+			ref, tail = strings.Join(segments[2:5], "/"), segments[5:]
 		}
-		return Link{URL: rawURL, Kind: KindRaw, Owner: segments[0], Name: segments[1], Ref: ref}, true
+		return Link{
+			URL: rawURL, Kind: KindRaw, Owner: segments[0], Name: segments[1], Ref: ref,
+			refAt: segmentOffset(offset, segments, 2), tail: tail,
+		}, true
 	}
 	return Link{}, false
+}
+
+func segmentOffset(start int, segments []string, index int) int {
+	for _, segment := range segments[:index] {
+		start += len(segment) + 1
+	}
+	return start
 }
 
 func githubKind(segment string) (Kind, bool) {
@@ -189,15 +243,27 @@ func trimScheme(url string) (string, bool) {
 	return "", false
 }
 
-func findURLs(line string) []string {
-	matches := urlPattern.FindAllString(line, -1)
-	candidates := make([]string, 0, len(matches))
-	for _, match := range matches {
-		candidates = append(candidates, strings.TrimRight(match, ".,;:!?"))
+// candidate is a URL as it was written, with where it starts on its line.
+type candidate struct {
+	url string
+	col int
+}
+
+func findURLs(line string) []candidate {
+	locations := urlPattern.FindAllStringIndex(line, -1)
+	candidates := make([]candidate, 0, len(locations))
+	for _, at := range locations {
+		url := strings.TrimRight(line[at[0]:at[1]], ".,;:!?")
+		if url == "" {
+			continue
+		}
+		candidates = append(candidates, candidate{url: url, col: at[0]})
 	}
 	return candidates
 }
 
+// stripCodeSpans blanks out code spans without moving anything after them, so
+// the column of a link is the column it has in the line as written.
 func stripCodeSpans(line string) string {
 	var out strings.Builder
 	i := 0
