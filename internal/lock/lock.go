@@ -1,5 +1,5 @@
 // Package lock reads and writes srcproof.lock, the record of which commit each
-// repository link in an article was pinned to.
+// repository link in an article was pinned to and which code it quotes.
 package lock
 
 import (
@@ -80,25 +80,39 @@ func (l Link) validate() error {
 	return validRef(l.Ref)
 }
 
-// Quote records the digest of the code an article cites at a commit.
+// Quote records one code block of an article: the digest of the block after
+// normalization, and the lines of the blob at the commit it was taken from.
 type Quote struct {
 	Article string
+	Digest  string
 	Repo    string
 	SHA     string
 	Path    string
-	Digest  string
+	Start   int
+	End     int
 }
 
-// Key is what makes two quote directives the same record.
-func (q Quote) Key() string { return q.Article + " " + q.Repo + " " + q.Path }
+// Key is what makes two quote directives the same record. A block is looked up
+// by its digest to decide whether it is the one that was pinned, so an article
+// records a digest once and under one place.
+func (q Quote) Key() string { return q.Article + " " + q.Digest }
+
+// Range is the START-END field as the format writes it.
+func (q Quote) Range() string { return strconv.Itoa(q.Start) + "-" + strconv.Itoa(q.End) }
+
+// Lines is how many lines of the blob the range covers.
+func (q Quote) Lines() int { return q.End - q.Start + 1 }
 
 func (q Quote) line() string {
-	return strings.Join([]string{"quote", q.Article, q.Repo, q.SHA, q.Path, q.Digest}, " ")
+	return strings.Join([]string{"quote", q.Article, q.Digest, q.Repo, q.SHA, q.Path, q.Range()}, " ")
 }
 
 func (q Quote) validate() error {
 	if err := validPath("article", q.Article); err != nil {
 		return err
+	}
+	if !digestSHA.MatchString(q.Digest) {
+		return fmt.Errorf("%q is not a 64-character lowercase digest", q.Digest)
 	}
 	if !repoName.MatchString(q.Repo) {
 		return fmt.Errorf("%q does not name a repository as owner/name", q.Repo)
@@ -109,8 +123,8 @@ func (q Quote) validate() error {
 	if err := validPath("quoted path", q.Path); err != nil {
 		return err
 	}
-	if !digestSHA.MatchString(q.Digest) {
-		return fmt.Errorf("%q is not a 64-character lowercase digest", q.Digest)
+	if q.Start < 1 || q.End < q.Start {
+		return fmt.Errorf("%q is not a line range of at least one line", q.Range())
 	}
 	return nil
 }
@@ -255,10 +269,14 @@ func (f *File) add(fields []string) (string, error) {
 		f.Links = append(f.Links, l)
 		return "link " + l.Key(), nil
 	case "quote":
-		if len(fields) != 6 {
-			return "", fmt.Errorf("quote takes ARTICLE REPO SHA PATH DIGEST, not %d fields", len(fields)-1)
+		if len(fields) != 7 {
+			return "", fmt.Errorf("quote takes ARTICLE SHA256 REPO COMMIT PATH START-END, not %d fields", len(fields)-1)
 		}
-		q := Quote{Article: fields[1], Repo: fields[2], SHA: fields[3], Path: fields[4], Digest: fields[5]}
+		start, end, err := parseRange(fields[6])
+		if err != nil {
+			return "", err
+		}
+		q := Quote{Article: fields[1], Digest: fields[2], Repo: fields[3], SHA: fields[4], Path: fields[5], Start: start, End: end}
 		if err := q.validate(); err != nil {
 			return "", err
 		}
@@ -276,6 +294,24 @@ func (f *File) add(fields []string) (string, error) {
 		return "allow " + a.Key(), nil
 	}
 	return "", fmt.Errorf("%q is not a directive of this format", fields[0])
+}
+
+// parseRange reads START-END and refuses any spelling of the same numbers the
+// format would not write back, so a range survives Format(Parse(x)) == x.
+func parseRange(field string) (int, int, error) {
+	first, last, ok := strings.Cut(field, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("%q is not a line range written as START-END", field)
+	}
+	start, err := strconv.Atoi(first)
+	if err != nil || start < 1 || strconv.Itoa(start) != first {
+		return 0, 0, fmt.Errorf("%q does not start at a line number", field)
+	}
+	end, err := strconv.Atoi(last)
+	if err != nil || end < start || strconv.Itoa(end) != last {
+		return 0, 0, fmt.Errorf("%q does not end at a line number at or after its start", field)
+	}
+	return start, end, nil
 }
 
 // parseNormalize reads the normalize line and then compares it against the

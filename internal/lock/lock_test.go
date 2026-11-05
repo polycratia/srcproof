@@ -16,7 +16,7 @@ const roundTrip = Header + "\n" +
 	"allow article.md ctsafe\n" +
 	"link article.md polycratia/srcproof " + sha + " feature/x\n" +
 	"link other.md polycratia/srcproof " + older + " v1.4.0\n" +
-	"quote article.md polycratia/srcproof " + sha + " internal/links/links.go " + digest + "\n"
+	"quote article.md " + digest + " polycratia/srcproof " + sha + " internal/links/links.go 10-20\n"
 
 func TestFormatOfParseIsTheSameFile(t *testing.T) {
 	file, err := Parse(roundTrip)
@@ -31,6 +31,13 @@ func TestFormatOfParseIsTheSameFile(t *testing.T) {
 	}
 	if file.Links[0].Ref != "feature/x" || file.Links[0].SHA != sha {
 		t.Errorf("first link %+v", file.Links[0])
+	}
+	quote := file.Quotes[0]
+	if quote.Digest != digest || quote.Path != "internal/links/links.go" {
+		t.Errorf("quote %+v", quote)
+	}
+	if quote.Start != 10 || quote.End != 20 || quote.Lines() != 11 {
+		t.Errorf("quote range %s covers %d line(s)", quote.Range(), quote.Lines())
 	}
 	got, err := file.Format()
 	if err != nil {
@@ -52,6 +59,9 @@ func TestFormatSortsAndParseReadsItBack(t *testing.T) {
 			{Article: "other.md", Repo: "polycratia/srcproof", SHA: older, Ref: "v1.4.0"},
 			{Article: "article.md", Repo: "polycratia/srcproof", SHA: sha, Ref: "feature/x"},
 		},
+		Quotes: []Quote{
+			{Article: "article.md", Digest: digest, Repo: "polycratia/srcproof", SHA: sha, Path: "go.mod", Start: 1, End: 3},
+		},
 		Allows: []Allow{{Article: "article.md", Word: "ctsafe"}},
 	}
 	text, err := file.Format()
@@ -62,7 +72,8 @@ func TestFormatSortsAndParseReadsItBack(t *testing.T) {
 		"normalize trailing-space\n" +
 		"allow article.md ctsafe\n" +
 		"link article.md polycratia/srcproof " + sha + " feature/x\n" +
-		"link other.md polycratia/srcproof " + older + " v1.4.0\n"
+		"link other.md polycratia/srcproof " + older + " v1.4.0\n" +
+		"quote article.md " + digest + " polycratia/srcproof " + sha + " go.mod 1-3\n"
 	if text != want {
 		t.Fatalf("Format = %q, want %q", text, want)
 	}
@@ -92,7 +103,21 @@ func TestFormatRefusesADuplicateKey(t *testing.T) {
 	}
 }
 
+func TestFormatRefusesTheSameBlockUnderTwoRanges(t *testing.T) {
+	file := File{
+		Normalize: Normalize{TrailingSpace: true},
+		Quotes: []Quote{
+			{Article: "article.md", Digest: digest, Repo: "polycratia/srcproof", SHA: sha, Path: "go.mod", Start: 1, End: 3},
+			{Article: "article.md", Digest: digest, Repo: "polycratia/srcproof", SHA: sha, Path: "go.mod", Start: 10, End: 12},
+		},
+	}
+	if _, err := file.Format(); err == nil {
+		t.Fatal("Format accepted one digest under two ranges")
+	}
+}
+
 func TestParseRefuses(t *testing.T) {
+	quote := "quote article.md " + digest + " polycratia/srcproof " + sha + " go.mod "
 	cases := []struct {
 		name string
 		text string
@@ -109,7 +134,12 @@ func TestParseRefuses(t *testing.T) {
 		{"two spaces between fields", Header + "\nnormalize trailing-space\nallow  article.md ctsafe\n"},
 		{"short sha", Header + "\nnormalize trailing-space\nlink article.md polycratia/srcproof " + sha[:39] + " main\n"},
 		{"uppercase sha", Header + "\nnormalize trailing-space\nlink article.md polycratia/srcproof " + strings.ToUpper(sha) + " main\n"},
-		{"short digest", Header + "\nnormalize trailing-space\nquote article.md polycratia/srcproof " + sha + " go.mod " + digest[:63] + "\n"},
+		{"short digest", Header + "\nnormalize trailing-space\nquote article.md " + digest[:63] + " polycratia/srcproof " + sha + " go.mod 1-3\n"},
+		{"quote without a range", Header + "\nnormalize trailing-space\n" + strings.TrimSuffix(quote, " ") + "\n"},
+		{"a range that ends before it starts", Header + "\nnormalize trailing-space\n" + quote + "5-3\n"},
+		{"a range from line zero", Header + "\nnormalize trailing-space\n" + quote + "0-3\n"},
+		{"a range with a leading zero", Header + "\nnormalize trailing-space\n" + quote + "03-05\n"},
+		{"a range that is one number", Header + "\nnormalize trailing-space\n" + quote + "3\n"},
 		{"unsorted lines", Header + "\nnormalize trailing-space\nlink other.md polycratia/srcproof " + sha + " main\nlink article.md polycratia/srcproof " + sha + " main\n"},
 		{"the same line twice", Header + "\nnormalize trailing-space\nallow article.md ctsafe\nallow article.md ctsafe\n"},
 		{"the same key twice", Header + "\nnormalize trailing-space\nlink article.md polycratia/srcproof " + older + " main\nlink article.md polycratia/srcproof " + sha + " main\n"},
