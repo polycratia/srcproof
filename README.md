@@ -2,7 +2,8 @@
 
 A lockfile and gate for prose that cites code. A link into a repository is only
 worth reading if it points at code that cannot move underneath it, so srcproof
-requires every repository link in Markdown to name a commit.
+requires every repository link in Markdown to name a commit, and every quoted
+block to be the code that commit holds.
 
 `check` enforces the pin. Every `github.com` blob, tree or commit link, and
 every `raw.githubusercontent.com` link, must name a ref that is exactly 40
@@ -50,8 +51,8 @@ was truncated.
 
 ## Pinning a branch link
 
-`pin` resolves the branch and tag links of one article and records what it
-resolved:
+`pin` resolves the branch and tag links of one article, records what it
+resolved, and records the quotes of the article:
 
 ```
 dist/srcproof pin docs/article.md --repo polycratia/srcproof=.
@@ -72,6 +73,30 @@ following the other ref would arrive at a different commit; name it as
 whose repository was not named with `--repo`, are reported and nothing is
 written.
 
+## Quoting code
+
+A fenced code block is a quote when the paragraph directly before or after it
+holds a permalink with a line range, `#L10` or `#L10-L20`. `pin` records one
+directive per quote, `quote ARTICLE SHA256 REPO COMMIT PATH START-END`, where
+the sha256 is taken over the block after normalization. Quotes are read out of
+the pinned article, so a block anchored by a branch link is recorded at the
+commit that link was just resolved to.
+
+`check` slices those lines out of the blob at that commit and compares them
+byte for byte, after only the normalizations the `normalize` line names. The
+range has to hold exactly as many lines as the block, so a widened range fails
+instead of matching loosely, and an elision such as `// ...` fails until the
+quote is split into two blocks with a permalink each.
+
+A block that hashes to no record in the lock was edited since it was pinned and
+is reported as such; a looser match is never looked for. A block with no
+permalink beside it is listed as unanchored and is neither checked nor claimed,
+and a permalink inside a code block anchors nothing.
+
+Quotes are compared where `srcproof.lock` sits beside the article and the
+repository is named with `--repo`. A commit the clone does not have is
+undecided, never a pass.
+
 ## The lock file
 
 `srcproof.lock` is format v1: the header, a `normalize` line, then sorted
@@ -82,6 +107,7 @@ srcproof-lock v1
 normalize trailing-space
 allow article.md ctsafe
 link article.md polycratia/srcproof 0123456789abcdef0123456789abcdef01234567 feature/x
+quote article.md 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef polycratia/srcproof 0123456789abcdef0123456789abcdef01234567 internal/lock/lock.go 10-20
 ```
 
 Normalization is `trailing-space` on its own by default; `--tabs N` adds
@@ -95,12 +121,13 @@ Records of other articles are carried over as they are.
 
 | Code | Meaning |
 | --- | --- |
-| 0 | every link names a commit, and every named clone has that commit |
-| 1 | at least one link does not name a full commit |
-| 2 | at least one link could not be decided, or the command was used wrongly |
+| 0 | every link names a commit, and every quote is the code it pins |
+| 1 | a link does not name a full commit, or a quote is not that code |
+| 2 | something could not be decided, or the command was used wrongly |
 
-`pin` uses the same codes: 0 when every link resolved, whether or not it was
-asked to write, and 2 when a ref could not be resolved.
+`pin` uses the same codes: 0 when every link resolved and every quote was
+recorded, whether or not it was asked to write, and 2 when a ref could not be
+resolved or a quote could not be recorded.
 
 ## Development
 
@@ -109,8 +136,8 @@ make test
 ```
 
 The tests for `internal/gitrepo` build throwaway clones with the git binary and
-skip when git is unavailable. The tests for `internal/pin` resolve refs through
-a stand-in and need no git.
+skip when git is unavailable. The tests for `internal/pin` and `internal/quote`
+resolve refs and read blobs through stand-ins and need no git.
 
 ---
 

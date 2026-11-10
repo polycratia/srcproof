@@ -10,9 +10,10 @@ import (
 	"github.com/polycratia/srcproof/internal/links"
 	"github.com/polycratia/srcproof/internal/lock"
 	"github.com/polycratia/srcproof/internal/pin"
+	"github.com/polycratia/srcproof/internal/quote"
 )
 
-const usage = `srcproof - repository links in prose must name a full commit
+const usage = `srcproof - prose must pin the code it cites
 
 Usage:
   srcproof check [--repo owner/name=PATH]... <file.md>...
@@ -20,23 +21,27 @@ Usage:
 
 check reads the given Markdown files and reports every github.com blob, tree or
 commit link, and every raw.githubusercontent.com link, whose ref is not exactly
-40 lowercase hex characters.
+40 lowercase hex characters. Where srcproof.lock sits beside an article, every
+fenced code block anchored by a line-range permalink is compared byte for byte
+against those lines of the blob at the pinned commit; a block with no permalink
+beside it is listed as unanchored and is neither checked nor claimed.
 
 pin resolves the branch and tag links of one article to the commit each ref
-reaches in the named clone. By default it only prints the link rewrites and the
-lock lines it would make; --write rewrites the links to the 40-hex commit and
-writes srcproof.lock beside the article. A ref with slashes makes
-blob/feature/x/path ambiguous, so pin takes the longest prefix that exists as a
-ref and refuses a name that is both a branch and a tag.
+reaches in the named clone and records the quotes of that article. By default it
+only prints the link rewrites and the lock lines it would make; --write
+rewrites the links to the 40-hex commit and writes srcproof.lock beside the
+article. A ref with slashes makes blob/feature/x/path ambiguous, so pin takes
+the longest prefix that exists as a ref and refuses a name that is both a
+branch and a tag.
 
 --repo names a local clone of a repository and may be repeated. A pinned link
 into a named repository is looked up in that clone, with replace refs off.
 --tabs N records in the lock file that a tab expands to N columns, 1 to 16.
 
 Exit codes:
-  0  every link names a commit, and every named clone has that commit
-  1  at least one link does not name a full commit
-  2  at least one link could not be decided, or the command was used wrongly
+  0  every link names a commit, and every quote is the code it pins
+  1  a link does not name a full commit, or a quote is not that code
+  2  something could not be decided, or the command was used wrongly
 `
 
 func main() {
@@ -83,7 +88,7 @@ func check(args []string) int {
 		}
 	}()
 
-	refused, undecided, unreadable := 0, 0, 0
+	refused, drifted, undecided, unreadable := 0, 0, 0, 0
 	for _, path := range paths {
 		source, err := os.ReadFile(path)
 		if err != nil {
@@ -106,18 +111,56 @@ func check(args []string) int {
 				undecided++
 			}
 		}
+		results, err := quoteResults(path, text, clones)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
+			unreadable++
+			continue
+		}
+		for _, result := range results {
+			switch result.Severity() {
+			case quote.Pass:
+				continue
+			case quote.Fail:
+				drifted++
+			case quote.Undecided:
+				undecided++
+			}
+			fmt.Fprintln(os.Stdout, result.String())
+		}
 	}
 	if refused > 0 {
 		fmt.Fprintf(os.Stderr, "srcproof: %d repository link(s) do not name a full commit\n", refused)
 	}
+	if drifted > 0 {
+		fmt.Fprintf(os.Stderr, "srcproof: %d quoted block(s) are not the code they pin\n", drifted)
+	}
 	if undecided > 0 {
-		fmt.Fprintf(os.Stderr, "srcproof: %d repository link(s) could not be decided\n", undecided)
+		fmt.Fprintf(os.Stderr, "srcproof: %d claim(s) could not be decided\n", undecided)
 		return 2
 	}
-	if refused > 0 || unreadable > 0 {
+	if refused > 0 || drifted > 0 || unreadable > 0 {
 		return 1
 	}
 	return 0
+}
+
+// quoteResults decides the code blocks of one article. Without a lock file
+// beside it nothing was ever pinned, so no block is claimed and none is
+// reported.
+func quoteResults(article, source string, clones map[string]*gitrepo.Repo) ([]quote.Result, error) {
+	file, found, err := pin.Load(pin.LockPath(article))
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, nil
+	}
+	blobs := make(map[string]quote.Blobs, len(clones))
+	for key, clone := range clones {
+		blobs[key] = clone
+	}
+	return quote.Check(quote.Request{Article: article, Source: source, Lock: file, Clones: blobs})
 }
 
 func runPin(args []string) int {
@@ -194,18 +237,20 @@ func runPin(args []string) int {
 		fmt.Fprintln(os.Stdout, problem.Error())
 	}
 	if len(plan.Problems) > 0 {
-		fmt.Fprintf(os.Stderr, "srcproof: %d repository link(s) could not be pinned; nothing was written\n", len(plan.Problems))
+		fmt.Fprintf(os.Stderr, "srcproof: %d claim(s) could not be pinned; nothing was written\n", len(plan.Problems))
 		return 2
 	}
 	if !*write {
-		fmt.Fprintf(os.Stderr, "srcproof: %d link(s) would be rewritten; run again with --write\n", len(plan.Rewrites))
+		fmt.Fprintf(os.Stderr, "srcproof: %d link(s) would be rewritten and %d quote(s) recorded; run again with --write\n",
+			len(plan.Rewrites), len(plan.Quotes))
 		return 0
 	}
 	if err := plan.Write(); err != nil {
 		fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
 		return 2
 	}
-	fmt.Fprintf(os.Stderr, "srcproof: rewrote %d link(s) in %s and wrote %s\n", len(plan.Rewrites), article, plan.LockPath)
+	fmt.Fprintf(os.Stderr, "srcproof: rewrote %d link(s) in %s, recorded %d quote(s), wrote %s\n",
+		len(plan.Rewrites), article, len(plan.Quotes), plan.LockPath)
 	return 0
 }
 

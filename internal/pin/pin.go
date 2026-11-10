@@ -13,6 +13,7 @@ import (
 	"github.com/polycratia/srcproof/internal/gitrepo"
 	"github.com/polycratia/srcproof/internal/links"
 	"github.com/polycratia/srcproof/internal/lock"
+	"github.com/polycratia/srcproof/internal/quote"
 )
 
 // LockName is the file pin writes beside the article.
@@ -88,6 +89,7 @@ type Plan struct {
 	LockText string
 	Lock     lock.File
 	Rewrites []Rewrite
+	Quotes   []lock.Quote
 	Problems []Problem
 }
 
@@ -127,9 +129,10 @@ func Load(path string) (lock.File, bool, error) {
 	return file, true, nil
 }
 
-// Resolve reads the links of an article and reports the rewrites and the lock
-// file they would make. Nothing is written, a ref resolved once is recorded
-// once, and the records of other articles are carried over untouched.
+// Resolve reads the links and the quotes of an article and reports the
+// rewrites and the lock file they would make. Nothing is written, a ref
+// resolved once is recorded once, and the records of other articles are
+// carried over untouched.
 func Resolve(req Request) (Plan, error) {
 	name := filepath.Base(req.Article)
 	plan := Plan{
@@ -140,12 +143,16 @@ func Resolve(req Request) (Plan, error) {
 	}
 	file := lock.File{
 		Normalize: req.Normalize,
-		Quotes:    req.Base.Quotes,
 		Allows:    req.Base.Allows,
 	}
 	for _, record := range req.Base.Links {
 		if record.Article != name {
 			file.Links = append(file.Links, record)
+		}
+	}
+	for _, record := range req.Base.Quotes {
+		if record.Article != name {
+			file.Quotes = append(file.Quotes, record)
 		}
 	}
 	recorded := make(map[string]bool)
@@ -184,14 +191,66 @@ func Resolve(req Request) (Plan, error) {
 			Line: link.Line, Col: link.Col, Ref: ref.Name, SHA: ref.SHA, From: link.URL, To: url,
 		})
 	}
+	// Quotes are read out of the pinned article, so a block anchored by a
+	// branch permalink is recorded at the commit that link was just resolved
+	// to rather than at a name that can still move.
+	plan.Pinned = apply(req.Source, plan.Rewrites)
+	quotes, problems := recordQuotes(name, req.Article, plan.Pinned, req.Normalize)
+	plan.Quotes = quotes
+	plan.Problems = append(plan.Problems, problems...)
+	file.Quotes = append(file.Quotes, quotes...)
 	plan.Lock = file
 	text, err := file.Format()
 	if err != nil {
 		return plan, fmt.Errorf("%s: %w", plan.LockPath, err)
 	}
 	plan.LockText = text
-	plan.Pinned = apply(req.Source, plan.Rewrites)
 	return plan, nil
+}
+
+// recordQuotes records the digest of every anchored code block of an article.
+// A block whose permalink names a different number of lines than the block
+// holds is reported instead of recorded, because such a record could never
+// match the blob; an unanchored block is left alone, neither checked later nor
+// claimed now.
+func recordQuotes(name, article, source string, n lock.Normalize) ([]lock.Quote, []Problem) {
+	var records []lock.Quote
+	var problems []Problem
+	seen := make(map[string]lock.Quote)
+	for _, block := range quote.Blocks(article, source) {
+		if block.Anchor == nil {
+			continue
+		}
+		anchor := *block.Anchor
+		at := links.Link{File: article, Line: block.Fence, URL: anchor.URL}
+		if anchor.Lines() != len(block.Lines) {
+			problems = append(problems, Problem{Link: at, Err: fmt.Errorf(
+				"the permalink names %s, %d line(s) of %s, but the block holds %d; name the lines the block quotes and nothing else",
+				anchor.Range(), anchor.Lines(), anchor.Path, len(block.Lines))})
+			continue
+		}
+		record := lock.Quote{
+			Article: name,
+			Digest:  quote.Digest(block.Lines, n),
+			Repo:    anchor.Repo,
+			SHA:     anchor.SHA,
+			Path:    anchor.Path,
+			Start:   anchor.Start,
+			End:     anchor.End,
+		}
+		first, taken := seen[record.Digest]
+		switch {
+		case taken && first != record:
+			problems = append(problems, Problem{Link: at, Err: fmt.Errorf(
+				"this block is quoted from lines %s of %s and from lines %s of %s; one block of text is recorded under one place",
+				record.Range(), record.Path, first.Range(), first.Path)})
+		case taken:
+		default:
+			seen[record.Digest] = record
+			records = append(records, record)
+		}
+	}
+	return records, problems
 }
 
 // resolveRef takes the longest candidate that exists as a ref. A candidate
