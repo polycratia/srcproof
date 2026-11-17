@@ -97,6 +97,37 @@ Quotes are compared where `srcproof.lock` sits beside the article and the
 repository is named with `--repo`. A commit the clone does not have is
 undecided, never a pass.
 
+## Names in code spans
+
+A code span that is shaped like a Go name — it holds a dot, an underscore, a
+capital letter or a trailing `()` — has to exist in the Go code of a commit the
+article pins. The symbol table is built with `go/parser` from every `.go` file
+outside `vendor/` and `testdata/`: package names, top-level funcs, types,
+consts and vars, methods as `Type.Method` and struct fields as `Type.Field`. A
+generic receiver is read under its own name, so a method on `Stack[T]` is
+`Stack.Push`, and a name is recorded both on its own and under its package, so
+both `Header` and `lock.Header` are found.
+
+A code span shaped like a repository path is looked up in the tree instead and
+has to be a file or a directory at one of those commits.
+
+```
+dist/srcproof check --repo polycratia/srcproof=. docs/article.md
+```
+
+Names are searched in the union of every commit the article pins, so prose that
+pins two commits may name what either of them holds. Go predeclared names pass,
+and so does a word on an `allow` line of the lock. A name that is nowhere is
+reported with up to three nearest existing names by edit distance, so a renamed
+function points at what it was renamed to. A qualifier that is a package
+imported from outside the repository is listed as `external, not checked`:
+nothing in the clone decides it. If a `.go` file did not parse and a name is
+not in what was read, the name is undecided and the exit code is 2, never 1.
+
+Spans inside a fenced code block are left alone, the same way links are. Without
+a clone for the repository nothing is read and nothing is reported: a code span
+is prose until there is something to check it against.
+
 ## The lock file
 
 `srcproof.lock` is format v1: the header, a `normalize` line, then sorted
@@ -121,8 +152,8 @@ Records of other articles are carried over as they are.
 
 | Code | Meaning |
 | --- | --- |
-| 0 | every link names a commit, and every quote is the code it pins |
-| 1 | a link does not name a full commit, or a quote is not that code |
+| 0 | every link names a commit, every quote is the code it pins, and every code span names something there |
+| 1 | a link does not name a full commit, a quote is not that code, or a code span names nothing |
 | 2 | something could not be decided, or the command was used wrongly |
 
 `pin` uses the same codes: 0 when every link resolved and every quote was
@@ -136,8 +167,9 @@ make test
 ```
 
 The tests for `internal/gitrepo` build throwaway clones with the git binary and
-skip when git is unavailable. The tests for `internal/pin` and `internal/quote`
-resolve refs and read blobs through stand-ins and need no git.
+skip when git is unavailable. The tests for `internal/pin`, `internal/quote`
+and `internal/ident` resolve refs and read trees and blobs through stand-ins
+and need no git.
 
 ---
 

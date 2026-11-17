@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/polycratia/srcproof/internal/gitrepo"
+	"github.com/polycratia/srcproof/internal/ident"
 	"github.com/polycratia/srcproof/internal/links"
 	"github.com/polycratia/srcproof/internal/lock"
 	"github.com/polycratia/srcproof/internal/pin"
@@ -24,7 +25,10 @@ commit link, and every raw.githubusercontent.com link, whose ref is not exactly
 40 lowercase hex characters. Where srcproof.lock sits beside an article, every
 fenced code block anchored by a line-range permalink is compared byte for byte
 against those lines of the blob at the pinned commit; a block with no permalink
-beside it is listed as unanchored and is neither checked nor claimed.
+beside it is listed as unanchored and is neither checked nor claimed. Every code
+span shaped like a Go name or like a repository path is checked against the Go
+code and the tree of the commits the article pins, and a name that is not there
+is reported with the nearest existing names.
 
 pin resolves the branch and tag links of one article to the commit each ref
 reaches in the named clone and records the quotes of that article. By default it
@@ -39,8 +43,10 @@ into a named repository is looked up in that clone, with replace refs off.
 --tabs N records in the lock file that a tab expands to N columns, 1 to 16.
 
 Exit codes:
-  0  every link names a commit, and every quote is the code it pins
-  1  a link does not name a full commit, or a quote is not that code
+  0  every link names a commit, every quote is the code it pins, and every code
+     span names something at that commit
+  1  a link does not name a full commit, a quote is not that code, or a code
+     span names nothing
   2  something could not be decided, or the command was used wrongly
 `
 
@@ -88,7 +94,7 @@ func check(args []string) int {
 		}
 	}()
 
-	refused, drifted, undecided, unreadable := 0, 0, 0, 0
+	refused, drifted, unnamed, undecided, unreadable := 0, 0, 0, 0, 0
 	for _, path := range paths {
 		source, err := os.ReadFile(path)
 		if err != nil {
@@ -111,19 +117,50 @@ func check(args []string) int {
 				undecided++
 			}
 		}
-		results, err := quoteResults(path, text, clones)
+		file, found, err := pin.Load(pin.LockPath(path))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
 			unreadable++
 			continue
 		}
-		for _, result := range results {
-			switch result.Severity() {
-			case quote.Pass:
+		// Without a lock file beside the article nothing was ever pinned, so no
+		// block is claimed and none is reported.
+		if found {
+			results, err := quote.Check(quote.Request{
+				Article: path, Source: text, Lock: file, Clones: blobsOf(clones),
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
+				unreadable++
 				continue
-			case quote.Fail:
-				drifted++
-			case quote.Undecided:
+			}
+			for _, result := range results {
+				switch result.Severity() {
+				case quote.Pass:
+					continue
+				case quote.Fail:
+					drifted++
+				case quote.Undecided:
+					undecided++
+				}
+				fmt.Fprintln(os.Stdout, result.String())
+			}
+		}
+		spans, err := ident.Check(ident.Request{
+			Article: path, Source: text, Lock: file, Trees: treesOf(clones),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
+			unreadable++
+			continue
+		}
+		for _, result := range spans {
+			switch result.Severity() {
+			case ident.Pass:
+				continue
+			case ident.Fail:
+				unnamed++
+			case ident.Undecided:
 				undecided++
 			}
 			fmt.Fprintln(os.Stdout, result.String())
@@ -135,32 +172,33 @@ func check(args []string) int {
 	if drifted > 0 {
 		fmt.Fprintf(os.Stderr, "srcproof: %d quoted block(s) are not the code they pin\n", drifted)
 	}
+	if unnamed > 0 {
+		fmt.Fprintf(os.Stderr, "srcproof: %d code span(s) name nothing at the commit they pin\n", unnamed)
+	}
 	if undecided > 0 {
 		fmt.Fprintf(os.Stderr, "srcproof: %d claim(s) could not be decided\n", undecided)
 		return 2
 	}
-	if refused > 0 || drifted > 0 || unreadable > 0 {
+	if refused > 0 || drifted > 0 || unnamed > 0 || unreadable > 0 {
 		return 1
 	}
 	return 0
 }
 
-// quoteResults decides the code blocks of one article. Without a lock file
-// beside it nothing was ever pinned, so no block is claimed and none is
-// reported.
-func quoteResults(article, source string, clones map[string]*gitrepo.Repo) ([]quote.Result, error) {
-	file, found, err := pin.Load(pin.LockPath(article))
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, nil
-	}
+func blobsOf(clones map[string]*gitrepo.Repo) map[string]quote.Blobs {
 	blobs := make(map[string]quote.Blobs, len(clones))
 	for key, clone := range clones {
 		blobs[key] = clone
 	}
-	return quote.Check(quote.Request{Article: article, Source: source, Lock: file, Clones: blobs})
+	return blobs
+}
+
+func treesOf(clones map[string]*gitrepo.Repo) map[string]ident.Tree {
+	trees := make(map[string]ident.Tree, len(clones))
+	for key, clone := range clones {
+		trees[key] = clone
+	}
+	return trees
 }
 
 func runPin(args []string) int {

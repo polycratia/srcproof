@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -214,6 +215,44 @@ func validRefName(name string) error {
 		return fmt.Errorf("%q: %w", name, ErrRefName)
 	}
 	return nil
+}
+
+// Files returns the paths of the files a commit holds, sorted. A symlink and a
+// submodule entry are left out, the way Blob refuses them: neither carries
+// code that can be read out of the commit.
+func (r *Repo) Files(commit string) ([]string, error) {
+	if !objectName.MatchString(commit) {
+		return nil, fmt.Errorf("%q: %w", commit, ErrObjectName)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.requireCommit(commit); err != nil {
+		return nil, err
+	}
+	out, err := r.run("ls-tree", "-r", "--full-tree", "-z", commit)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, record := range strings.Split(out, "\x00") {
+		if record == "" {
+			continue
+		}
+		info, name, ok := strings.Cut(record, "\t")
+		if !ok || name == "" {
+			continue
+		}
+		fields := strings.Fields(info)
+		if len(fields) != 3 || fields[1] != "blob" {
+			continue
+		}
+		if fields[0] == modeSymlink || fields[0] == modeSubmodule {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // Blob returns the bytes of path at commit. A symlink and a submodule entry

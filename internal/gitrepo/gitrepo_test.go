@@ -88,6 +88,48 @@ func TestBlobRefusesASubmodule(t *testing.T) {
 	}
 }
 
+func TestFilesListsTheFilesOfACommit(t *testing.T) {
+	dir := newRepo(t)
+	head := commit(t, dir, "first", map[string]string{
+		"go.mod":                  "module example.com/one\n",
+		"internal/links/links.go": "package links\n",
+	})
+	repo := open(t, dir)
+
+	got, err := repo.Files(head)
+	if err != nil {
+		t.Fatalf("Files: %v", err)
+	}
+	want := []string{"go.mod", "internal/links/links.go"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("Files = %v, want %v", got, want)
+	}
+	if _, err := repo.Files(absent); !errors.Is(err, ErrMissingHistory) {
+		t.Errorf("Files on a commit the clone does not have: %v, want ErrMissingHistory", err)
+	}
+	if _, err := repo.Files("main"); !errors.Is(err, ErrObjectName) {
+		t.Errorf("Files(%q): %v, want ErrObjectName", "main", err)
+	}
+}
+
+func TestFilesLeavesOutASubmodule(t *testing.T) {
+	dir := newRepo(t)
+	head := commit(t, dir, "first", map[string]string{"go.mod": "module example.com/one\n"})
+	git(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+head+",vendor/dep")
+	tree := git(t, dir, "write-tree")
+	gitlink := gitInput(t, dir, "add a gitlink\n", "commit-tree", tree, "-p", head)
+
+	got, err := open(t, dir).Files(gitlink)
+	if err != nil {
+		t.Fatalf("Files: %v", err)
+	}
+	for _, name := range got {
+		if name == "vendor/dep" {
+			t.Fatalf("Files = %v, which holds a submodule entry", got)
+		}
+	}
+}
+
 func TestAMissingCommitIsNotAPass(t *testing.T) {
 	dir := newRepo(t)
 	commit(t, dir, "first", map[string]string{"go.mod": "module example.com/one\n"})
