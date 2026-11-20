@@ -144,6 +144,33 @@ func (r *Repo) RequireCommit(commit string) error {
 	return r.requireCommit(commit)
 }
 
+// Commit reports the commit a name reaches: the commit the clone is on when
+// the name is empty or HEAD, a 40-hex commit as it stands, and a branch or a
+// tag through Resolve.
+func (r *Repo) Commit(name string) (string, error) {
+	switch {
+	case name == "", name == "HEAD":
+		sha, found, err := r.refCommit("HEAD")
+		switch {
+		case err != nil:
+			return "", err
+		case !found:
+			return "", fmt.Errorf("HEAD is not at a commit in the clone at %s: %w", r.dir, ErrMissingRef)
+		}
+		return sha, nil
+	case objectName.MatchString(name):
+		if err := r.RequireCommit(name); err != nil {
+			return "", err
+		}
+		return name, nil
+	}
+	ref, err := r.Resolve(name)
+	if err != nil {
+		return "", err
+	}
+	return ref.SHA, nil
+}
+
 // Resolve finds name as a branch or a tag and reports the commit it reaches. A
 // name that is both a branch and a tag is refused instead of resolved: git
 // prefers one of them, and a reader following the other name would arrive at a
@@ -267,26 +294,9 @@ func (r *Repo) Blob(commit, path string) ([]byte, error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := r.requireCommit(commit); err != nil {
-		return nil, err
-	}
-	entry, found, err := r.entry(commit, clean)
+	entry, err := r.blobEntry(commit, clean)
 	if err != nil {
 		return nil, err
-	}
-	if !found {
-		return nil, fmt.Errorf("%s is not in commit %s: %w", clean, commit, ErrMissingPath)
-	}
-	switch {
-	case entry.mode == modeSymlink:
-		return nil, &NotQuotableError{Commit: commit, Path: clean, Mode: entry.mode, Kind: "symlink"}
-	case entry.mode == modeSubmodule:
-		return nil, &NotQuotableError{Commit: commit, Path: clean, Mode: entry.mode, Kind: "submodule"}
-	case entry.typ != "blob":
-		return nil, &NotQuotableError{Commit: commit, Path: clean, Mode: entry.mode, Kind: entry.typ}
-	}
-	if !objectName.MatchString(entry.oid) {
-		return nil, fmt.Errorf("git named the object %q: %w", entry.oid, ErrObjectName)
 	}
 	object, found, err := r.read(entry.oid)
 	if err != nil {
@@ -296,6 +306,86 @@ func (r *Repo) Blob(commit, path string) ([]byte, error) {
 		return nil, fmt.Errorf("blob %s of %s in commit %s is absent: %w", entry.oid, clean, commit, ErrMissingHistory)
 	}
 	return object.data, nil
+}
+
+// BlobID is the object name of the blob at path in commit. Two commits whose
+// blob ids agree hold the same bytes there, which is cheaper to ask than it is
+// to read both.
+func (r *Repo) BlobID(commit, path string) (string, error) {
+	if !objectName.MatchString(commit) {
+		return "", fmt.Errorf("%q: %w", commit, ErrObjectName)
+	}
+	clean, err := cleanPath(path)
+	if err != nil {
+		return "", err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, err := r.blobEntry(commit, clean)
+	if err != nil {
+		return "", err
+	}
+	return entry.oid, nil
+}
+
+// Renames maps the path a file had at from to the path it has at to, as git
+// finds renames between the two commits. The caller must not hold r.mu.
+func (r *Repo) Renames(from, to string) (map[string]string, error) {
+	if err := r.requirePair(from, to); err != nil {
+		return nil, err
+	}
+	out, err := r.run("diff", "-M", "--name-status", "-z", from, to, "--")
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Split(out, "\x00")
+	renames := make(map[string]string)
+	for i := 0; i < len(fields); {
+		status := fields[i]
+		if status == "" {
+			i++
+			continue
+		}
+		// A rename and a copy are the two statuses that name a second path.
+		if status[0] == 'R' || status[0] == 'C' {
+			if i+2 >= len(fields) {
+				return nil, fmt.Errorf("git diff -M --name-status: unreadable record %q", status)
+			}
+			renames[fields[i+1]] = fields[i+2]
+			i += 3
+			continue
+		}
+		i += 2
+	}
+	return renames, nil
+}
+
+// Added returns the paths git sees as added between two commits, sorted.
+func (r *Repo) Added(from, to string) ([]string, error) {
+	if err := r.requirePair(from, to); err != nil {
+		return nil, err
+	}
+	out, err := r.run("diff", "--diff-filter=A", "--name-only", "-z", from, to, "--")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, name := range strings.Split(out, "\x00") {
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func (r *Repo) requirePair(from, to string) error {
+	for _, commit := range []string{from, to} {
+		if err := r.RequireCommit(commit); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *Repo) requireCommit(commit string) error {
@@ -313,6 +403,33 @@ type treeEntry struct {
 	mode string
 	typ  string
 	oid  string
+}
+
+// blobEntry finds the entry of a path at a commit and refuses anything whose
+// bytes cannot stand in for code. The caller holds r.mu.
+func (r *Repo) blobEntry(commit, clean string) (treeEntry, error) {
+	if err := r.requireCommit(commit); err != nil {
+		return treeEntry{}, err
+	}
+	entry, found, err := r.entry(commit, clean)
+	if err != nil {
+		return treeEntry{}, err
+	}
+	if !found {
+		return treeEntry{}, fmt.Errorf("%s is not in commit %s: %w", clean, commit, ErrMissingPath)
+	}
+	switch {
+	case entry.mode == modeSymlink:
+		return treeEntry{}, &NotQuotableError{Commit: commit, Path: clean, Mode: entry.mode, Kind: "symlink"}
+	case entry.mode == modeSubmodule:
+		return treeEntry{}, &NotQuotableError{Commit: commit, Path: clean, Mode: entry.mode, Kind: "submodule"}
+	case entry.typ != "blob":
+		return treeEntry{}, &NotQuotableError{Commit: commit, Path: clean, Mode: entry.mode, Kind: entry.typ}
+	}
+	if !objectName.MatchString(entry.oid) {
+		return treeEntry{}, fmt.Errorf("git named the object %q: %w", entry.oid, ErrObjectName)
+	}
+	return entry, nil
 }
 
 func (r *Repo) entry(commit, path string) (treeEntry, bool, error) {
