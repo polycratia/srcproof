@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/polycratia/srcproof/internal/drift"
 	"github.com/polycratia/srcproof/internal/gitrepo"
 	"github.com/polycratia/srcproof/internal/ident"
 	"github.com/polycratia/srcproof/internal/links"
@@ -19,6 +20,7 @@ const usage = `srcproof - prose must pin the code it cites
 Usage:
   srcproof check [--repo owner/name=PATH]... <file.md>...
   srcproof pin <file.md> [--repo owner/name=PATH]... [--write] [--tabs N]
+  srcproof drift <file.md> [--against REF] [--repo owner/name=PATH]...
 
 check reads the given Markdown files and reports every github.com blob, tree or
 commit link, and every raw.githubusercontent.com link, whose ref is not exactly
@@ -38,9 +40,21 @@ article. A ref with slashes makes blob/feature/x/path ambiguous, so pin takes
 the longest prefix that exists as a ref and refuses a name that is both a
 branch and a tag.
 
+drift compares the quotes srcproof.lock records for one article against another
+commit, HEAD by default. A quote is unchanged when the blob at its path is the
+same or its bytes still sit at the same lines; it moved when its bytes are
+found exactly once elsewhere, searched for in the same file, then in the rename
+target, then in the files added between the two commits; it changed when the
+path is there but the bytes are missing or at more than one place; it was
+deleted when the path is gone and nothing matches. Moved quotes are written to
+srcproof.lock.proposed and srcproof.lock itself is never touched. Code spans
+that name something at the pinned commit and nothing at the other one are
+listed.
+
 --repo names a local clone of a repository and may be repeated. A pinned link
 into a named repository is looked up in that clone, with replace refs off.
 --tabs N records in the lock file that a tab expands to N columns, 1 to 16.
+--against names the ref drift compares with.
 
 Exit codes:
   0  every link names a commit, every quote is the code it pins, and every code
@@ -61,6 +75,8 @@ func main() {
 		os.Exit(check(args[1:]))
 	case "pin":
 		os.Exit(runPin(args[1:]))
+	case "drift":
+		os.Exit(runDrift(args[1:]))
 	case "help", "-h", "--help":
 		fmt.Fprint(os.Stdout, usage)
 	default:
@@ -201,6 +217,14 @@ func treesOf(clones map[string]*gitrepo.Repo) map[string]ident.Tree {
 	return trees
 }
 
+func reposOf(clones map[string]*gitrepo.Repo) map[string]drift.Repo {
+	repos := make(map[string]drift.Repo, len(clones))
+	for key, clone := range clones {
+		repos[key] = clone
+	}
+	return repos
+}
+
 func runPin(args []string) int {
 	named := newClones()
 	flags := flag.NewFlagSet("pin", flag.ContinueOnError)
@@ -289,6 +313,84 @@ func runPin(args []string) int {
 	}
 	fmt.Fprintf(os.Stderr, "srcproof: rewrote %d link(s) in %s, recorded %d quote(s), wrote %s\n",
 		len(plan.Rewrites), article, len(plan.Quotes), plan.LockPath)
+	return 0
+}
+
+func runDrift(args []string) int {
+	named := newClones()
+	flags := flag.NewFlagSet("drift", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() { fmt.Fprint(os.Stderr, usage) }
+	flags.Var(named, "repo", "local clone of a repository, as owner/name=PATH; repeatable")
+	against := flags.String("against", "HEAD", "the ref the pinned quotes are compared with")
+	paths, err := parseInterleaved(flags, args)
+	if err != nil {
+		return 2
+	}
+	if len(paths) != 1 {
+		fmt.Fprint(os.Stderr, "srcproof drift: name exactly one Markdown file\n\n"+usage)
+		return 2
+	}
+	article := paths[0]
+	lockPath := pin.LockPath(article)
+	file, found, err := pin.Load(lockPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
+		return 2
+	}
+	if !found {
+		fmt.Fprintf(os.Stderr, "srcproof: no %s sits beside %s; nothing was pinned to compare\n", pin.LockName, article)
+		return 2
+	}
+	source, err := os.ReadFile(article)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
+		return 2
+	}
+	clones, err := named.open()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
+		return 2
+	}
+	defer func() {
+		for _, clone := range clones {
+			clone.Close()
+		}
+	}()
+	report, err := drift.Check(drift.Request{
+		Article:  article,
+		Source:   string(source),
+		Lock:     file,
+		LockPath: lockPath,
+		Against:  *against,
+		Clones:   reposOf(clones),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
+		return 2
+	}
+	for _, result := range report.Results {
+		fmt.Fprintln(os.Stdout, result.String())
+	}
+	for _, name := range report.Gone {
+		fmt.Fprintln(os.Stdout, name.String())
+	}
+	if moved := report.Count(drift.Moved); moved > 0 {
+		if err := report.Write(); err != nil {
+			fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
+			return 2
+		}
+		fmt.Fprintf(os.Stderr, "srcproof: %d quote(s) moved; wrote %s and left %s as it is\n",
+			moved, report.ProposedPath, lockPath)
+	}
+	if undecided := report.Count(drift.Undecided); undecided > 0 {
+		fmt.Fprintf(os.Stderr, "srcproof: %d quote(s) could not be decided\n", undecided)
+		return 2
+	}
+	if gone := report.Count(drift.Changed) + report.Count(drift.Deleted); gone > 0 {
+		fmt.Fprintf(os.Stderr, "srcproof: %d quote(s) are not the code they pin at %s\n", gone, *against)
+		return 1
+	}
 	return 0
 }
 
