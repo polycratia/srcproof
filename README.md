@@ -9,7 +9,8 @@ block to be the code that commit holds.
 every `raw.githubusercontent.com` link, must name a ref that is exactly 40
 lowercase hex characters. A branch name, a tag, an abbreviated sha and an
 uppercase sha are each refused with their own message and a `file:line`.
-`pin` is how a branch link becomes a pinned one.
+`pin` is how a branch link becomes a pinned one, and `drift` is how a pinned
+article is read against newer code.
 
 ## Usage
 
@@ -128,6 +129,44 @@ Spans inside a fenced code block are left alone, the same way links are. Without
 a clone for the repository nothing is read and nothing is reported: a code span
 is prose until there is something to check it against.
 
+## Drift against another commit
+
+`check` asks whether an article is still true at the commit it pins. `drift`
+asks the next question: what has the code done since. It compares the quotes
+`srcproof.lock` records for one article against another commit, `HEAD` by
+default:
+
+```
+dist/srcproof drift docs/article.md --repo polycratia/srcproof=.
+dist/srcproof drift docs/article.md --against v1.4.0 --repo polycratia/srcproof=.
+```
+
+Every recorded quote falls in one class:
+
+| Class | What it means |
+| --- | --- |
+| unchanged | the blob at the path is the same object, or those lines still read the same |
+| moved | the bytes are found exactly once somewhere else |
+| changed | the path is still there, but the bytes are missing or at more than one place |
+| deleted | the path is gone and nothing matches |
+
+The search for bytes that moved goes in one order: the shifted lines of the
+same file, then the rename target `git diff -M --name-status -z` names, then the
+files added between the two commits. It is bounded to 200 blobs or 8 MiB read
+through `git cat-file --batch`, and a search that stopped at the bound says so
+instead of claiming the bytes are gone. Bytes found at more than one place are
+`changed` and never moved: no one range is the quote, so none is proposed.
+
+Moved quotes are written to `srcproof.lock.proposed` beside the lock, each with
+its new commit, path and line range, and with the records of every other
+article carried over as they are. `srcproof.lock` itself is never opened for
+writing: what moved is offered, not applied. Read the proposal, then put it in
+place yourself or run `pin --write` again.
+
+Code spans that name something in the Go code at the pinned commit and nothing
+at the commit the comparison is made against are listed with the commit they
+are missing from.
+
 ## The lock file
 
 `srcproof.lock` is format v1: the header, a `normalize` line, then sorted
@@ -160,6 +199,10 @@ Records of other articles are carried over as they are.
 recorded, whether or not it was asked to write, and 2 when a ref could not be
 resolved or a quote could not be recorded.
 
+`drift` exits 1 when any quote changed or was deleted, and 2 when a commit is
+not in the clone or no repository was named for it. A quote that only moved is
+not a failure: the proposal is written and the exit code stays 0.
+
 ## Development
 
 ```
@@ -167,9 +210,10 @@ make test
 ```
 
 The tests for `internal/gitrepo` build throwaway clones with the git binary and
-skip when git is unavailable. The tests for `internal/pin`, `internal/quote`
-and `internal/ident` resolve refs and read trees and blobs through stand-ins
-and need no git.
+skip when git is unavailable. The tests for `internal/pin`, `internal/quote`,
+`internal/ident` and `internal/drift` resolve refs and read trees and blobs
+through stand-ins and need no git; the drift stand-in counts the blobs it was
+asked for, so the search bound is covered too.
 
 ---
 
