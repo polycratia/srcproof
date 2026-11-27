@@ -13,6 +13,7 @@ import (
 	"github.com/polycratia/srcproof/internal/lock"
 	"github.com/polycratia/srcproof/internal/pin"
 	"github.com/polycratia/srcproof/internal/quote"
+	"github.com/polycratia/srcproof/internal/record"
 )
 
 const usage = `srcproof - prose must pin the code it cites
@@ -21,6 +22,7 @@ Usage:
   srcproof check [--repo owner/name=PATH]... <file.md>...
   srcproof pin <file.md> [--repo owner/name=PATH]... [--write] [--tabs N]
   srcproof drift <file.md> [--against REF] [--repo owner/name=PATH]...
+  srcproof record <file.md> --url URL [--repo owner/name=PATH]...
 
 check reads the given Markdown files and reports every github.com blob, tree or
 commit link, and every raw.githubusercontent.com link, whose ref is not exactly
@@ -51,10 +53,20 @@ srcproof.lock.proposed and srcproof.lock itself is never touched. Code spans
 that name something at the pinned commit and nothing at the other one are
 listed.
 
+record writes FILE.srcproof.jsonld beside one article: a schema.org TechArticle
+in JSON-LD whose identifier is the sha256 of the article bytes, whose isBasedOn
+holds one SoftwareSourceCode per checked quote with the repository, the commit,
+the permalink and the sha256 of the quote, and whose citation holds the pinned
+links the article does not quote. It is written only after the checks check
+makes pass, and an article that quotes nothing and pins nothing is refused. The
+document carries no timestamp and its arrays are sorted, so the same inputs
+write the same bytes.
+
 --repo names a local clone of a repository and may be repeated. A pinned link
 into a named repository is looked up in that clone, with replace refs off.
 --tabs N records in the lock file that a tab expands to N columns, 1 to 16.
 --against names the ref drift compares with.
+--url names where the article is published.
 
 Exit codes:
   0  every link names a commit, every quote is the code it pins, and every code
@@ -77,12 +89,96 @@ func main() {
 		os.Exit(runPin(args[1:]))
 	case "drift":
 		os.Exit(runDrift(args[1:]))
+	case "record":
+		os.Exit(runRecord(args[1:]))
 	case "help", "-h", "--help":
 		fmt.Fprint(os.Stdout, usage)
 	default:
 		fmt.Fprintf(os.Stderr, "srcproof: unknown subcommand %q\n\n%s", args[0], usage)
 		os.Exit(2)
 	}
+}
+
+// verdict is what check decided about one article: the counts it reports and
+// the quote results a record is built from.
+type verdict struct {
+	Source    string
+	Quotes    []quote.Result
+	Refused   int
+	Drifted   int
+	Unnamed   int
+	Undecided int
+}
+
+func (v verdict) failed() int { return v.Refused + v.Drifted + v.Unnamed }
+
+// checkArticle checks one article and prints what it found. An error is
+// something that could not be read at all, not a claim that does not hold.
+func checkArticle(path string, clones map[string]*gitrepo.Repo) (verdict, error) {
+	source, err := os.ReadFile(path)
+	if err != nil {
+		return verdict{}, err
+	}
+	text := string(source)
+	decided := verdict{Source: text}
+	for _, refusal := range links.Check(path, text) {
+		fmt.Fprintln(os.Stdout, refusal.String())
+		decided.Refused++
+	}
+	for _, link := range links.Extract(path, text) {
+		clone, named := clones[strings.ToLower(link.Owner+"/"+link.Name)]
+		if !named || !link.Pinned() {
+			continue
+		}
+		if err := clone.RequireCommit(link.Ref); err != nil {
+			fmt.Fprintf(os.Stdout, "%s:%d: cannot decide: %v\n", link.File, link.Line, err)
+			decided.Undecided++
+		}
+	}
+	file, found, err := pin.Load(pin.LockPath(path))
+	if err != nil {
+		return verdict{}, err
+	}
+	// Without a lock file beside the article nothing was ever pinned, so no
+	// block is claimed and none is reported.
+	if found {
+		results, err := quote.Check(quote.Request{
+			Article: path, Source: text, Lock: file, Clones: blobsOf(clones),
+		})
+		if err != nil {
+			return verdict{}, err
+		}
+		decided.Quotes = results
+		for _, result := range results {
+			switch result.Severity() {
+			case quote.Pass:
+				continue
+			case quote.Fail:
+				decided.Drifted++
+			case quote.Undecided:
+				decided.Undecided++
+			}
+			fmt.Fprintln(os.Stdout, result.String())
+		}
+	}
+	spans, err := ident.Check(ident.Request{
+		Article: path, Source: text, Lock: file, Trees: treesOf(clones),
+	})
+	if err != nil {
+		return verdict{}, err
+	}
+	for _, result := range spans {
+		switch result.Severity() {
+		case ident.Pass:
+			continue
+		case ident.Fail:
+			decided.Unnamed++
+		case ident.Undecided:
+			decided.Undecided++
+		}
+		fmt.Fprintln(os.Stdout, result.String())
+	}
+	return decided, nil
 }
 
 func check(args []string) int {
@@ -112,75 +208,16 @@ func check(args []string) int {
 
 	refused, drifted, unnamed, undecided, unreadable := 0, 0, 0, 0, 0
 	for _, path := range paths {
-		source, err := os.ReadFile(path)
+		decided, err := checkArticle(path, clones)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
 			unreadable++
 			continue
 		}
-		text := string(source)
-		for _, refusal := range links.Check(path, text) {
-			fmt.Fprintln(os.Stdout, refusal.String())
-			refused++
-		}
-		for _, link := range links.Extract(path, text) {
-			clone, named := clones[strings.ToLower(link.Owner+"/"+link.Name)]
-			if !named || !link.Pinned() {
-				continue
-			}
-			if err := clone.RequireCommit(link.Ref); err != nil {
-				fmt.Fprintf(os.Stdout, "%s:%d: cannot decide: %v\n", link.File, link.Line, err)
-				undecided++
-			}
-		}
-		file, found, err := pin.Load(pin.LockPath(path))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
-			unreadable++
-			continue
-		}
-		// Without a lock file beside the article nothing was ever pinned, so no
-		// block is claimed and none is reported.
-		if found {
-			results, err := quote.Check(quote.Request{
-				Article: path, Source: text, Lock: file, Clones: blobsOf(clones),
-			})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
-				unreadable++
-				continue
-			}
-			for _, result := range results {
-				switch result.Severity() {
-				case quote.Pass:
-					continue
-				case quote.Fail:
-					drifted++
-				case quote.Undecided:
-					undecided++
-				}
-				fmt.Fprintln(os.Stdout, result.String())
-			}
-		}
-		spans, err := ident.Check(ident.Request{
-			Article: path, Source: text, Lock: file, Trees: treesOf(clones),
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
-			unreadable++
-			continue
-		}
-		for _, result := range spans {
-			switch result.Severity() {
-			case ident.Pass:
-				continue
-			case ident.Fail:
-				unnamed++
-			case ident.Undecided:
-				undecided++
-			}
-			fmt.Fprintln(os.Stdout, result.String())
-		}
+		refused += decided.Refused
+		drifted += decided.Drifted
+		unnamed += decided.Unnamed
+		undecided += decided.Undecided
 	}
 	if refused > 0 {
 		fmt.Fprintf(os.Stderr, "srcproof: %d repository link(s) do not name a full commit\n", refused)
@@ -391,6 +428,71 @@ func runDrift(args []string) int {
 		fmt.Fprintf(os.Stderr, "srcproof: %d quote(s) are not the code they pin at %s\n", gone, *against)
 		return 1
 	}
+	return 0
+}
+
+func runRecord(args []string) int {
+	named := newClones()
+	flags := flag.NewFlagSet("record", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() { fmt.Fprint(os.Stderr, usage) }
+	flags.Var(named, "repo", "local clone of a repository, as owner/name=PATH; repeatable")
+	url := flags.String("url", "", "the URL the article is published at")
+	paths, err := parseInterleaved(flags, args)
+	if err != nil {
+		return 2
+	}
+	if len(paths) != 1 {
+		fmt.Fprint(os.Stderr, "srcproof record: name exactly one Markdown file\n\n"+usage)
+		return 2
+	}
+	if *url == "" {
+		fmt.Fprint(os.Stderr, "srcproof record: name where the article is published as --url URL\n\n"+usage)
+		return 2
+	}
+	article := paths[0]
+	clones, err := named.open()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
+		return 2
+	}
+	defer func() {
+		for _, clone := range clones {
+			clone.Close()
+		}
+	}()
+	// The record states what was checked, so it is built from the checks
+	// themselves and written only once every one of them has passed.
+	decided, err := checkArticle(article, clones)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
+		return 2
+	}
+	if decided.Undecided > 0 {
+		fmt.Fprintf(os.Stderr, "srcproof: %d claim(s) could not be decided; nothing was written\n", decided.Undecided)
+		return 2
+	}
+	if failed := decided.failed(); failed > 0 {
+		fmt.Fprintf(os.Stderr, "srcproof: %d claim(s) of %s do not hold; nothing was written\n", failed, article)
+		return 1
+	}
+	rec, err := record.Build(record.Request{
+		Article: article,
+		Source:  decided.Source,
+		URL:     *url,
+		Quotes:  decided.Quotes,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
+		return 2
+	}
+	path := record.Path(article)
+	if err := os.WriteFile(path, []byte(rec.Text), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "srcproof: %v\n", err)
+		return 2
+	}
+	fmt.Fprintf(os.Stderr, "srcproof: wrote %s with %d quote(s) and %d citation(s)\n",
+		path, len(rec.Document.IsBasedOn), len(rec.Document.Citation))
 	return 0
 }
 

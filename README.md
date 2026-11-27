@@ -9,8 +9,9 @@ block to be the code that commit holds.
 every `raw.githubusercontent.com` link, must name a ref that is exactly 40
 lowercase hex characters. A branch name, a tag, an abbreviated sha and an
 uppercase sha are each refused with their own message and a `file:line`.
-`pin` is how a branch link becomes a pinned one, and `drift` is how a pinned
-article is read against newer code.
+`pin` is how a branch link becomes a pinned one, `drift` is how a pinned
+article is read against newer code, and `record` is how a checked article
+publishes what it pins.
 
 ## Usage
 
@@ -167,6 +168,33 @@ Code spans that name something in the Go code at the pinned commit and nothing
 at the commit the comparison is made against are listed with the commit they
 are missing from.
 
+## The JSON-LD record
+
+`record` writes what an article has been checked to claim, as
+`FILE.srcproof.jsonld` beside it: a schema.org `TechArticle` in JSON-LD.
+
+```
+dist/srcproof record docs/article.md --url https://example.com/article --repo polycratia/srcproof=.
+```
+
+`identifier` is the sha256 of the article bytes. `isBasedOn` holds one
+`SoftwareSourceCode` per checked quote, with `codeRepository`, `version` set to
+the commit, `url` set to the permalink with its line range, and `identifier`
+set to the sha256 of the quote. `citation` holds the pinned links the article
+does not quote. Every digest rides on a `PropertyValue` with `propertyID`
+`sha256`, because schema.org puts the `sha256` property on `MediaObject` and
+these digests are of an article and of a quoted block.
+
+The document is built from structs, carries no timestamp, and has its arrays
+sorted by repository, commit, path and start line; HTML escaping is off, the
+indent is two spaces and there is one trailing newline. The same inputs write
+the same bytes, so a published record can be compared with a freshly built one.
+
+The record is written only after the checks `check` makes pass: a link that
+names no commit, a block that is not the code it pins, or a code span that
+names nothing leaves nothing written. An article that quotes nothing and pins
+nothing is refused too, because there is no claim to record.
+
 ## The lock file
 
 `srcproof.lock` is format v1: the header, a `normalize` line, then sorted
@@ -203,6 +231,9 @@ resolved or a quote could not be recorded.
 not in the clone or no repository was named for it. A quote that only moved is
 not a failure: the proposal is written and the exit code stays 0.
 
+`record` uses the codes of the checks it makes first, and exits 2 when the
+article has no claim to record or no `--url` was given.
+
 ## Development
 
 ```
@@ -211,9 +242,10 @@ make test
 
 The tests for `internal/gitrepo` build throwaway clones with the git binary and
 skip when git is unavailable. The tests for `internal/pin`, `internal/quote`,
-`internal/ident` and `internal/drift` resolve refs and read trees and blobs
-through stand-ins and need no git; the drift stand-in counts the blobs it was
-asked for, so the search bound is covered too.
+`internal/ident`, `internal/drift` and `internal/record` resolve refs and read
+trees and blobs through stand-ins and need no git; the drift stand-in counts the
+blobs it was asked for, so the search bound is covered too, and the record test
+builds the document twice and from reordered claims and compares the bytes.
 
 ---
 
